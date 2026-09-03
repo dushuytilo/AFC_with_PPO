@@ -1,3 +1,5 @@
+The authors gratefully acknowledge Jonas Lemke for the development of the original experimental PPO and measurement-control framework (https://github.com/Jonas-Lemke/afc_with_ppo) on which substantial parts of the present implementation are based. His Master’s thesis at TU Berlin [2025] also served as a motivation to use a finite reward horizon for temporal credit assignment.
+
 # afc_with_ppo
 
 ## Table of Contents
