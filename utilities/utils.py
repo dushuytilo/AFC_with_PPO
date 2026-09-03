@@ -1,10 +1,11 @@
 """
-This file contains general-purpose functions
+This file contains general-purpose functions to manage logging
 """
-
 import os
 import csv
 
+def transpose_list(matrix):
+    return [[row[i] for row in matrix] for i in range(len(matrix[0]))]
 
 def mkdir(base, name):
     path = os.path.join(base, name)
@@ -12,12 +13,10 @@ def mkdir(base, name):
         os.makedirs(path)
     return path
 
-
 def create_file(file_path, header_list):
     with open(file_path, 'w', newline='') as file:
         writer = csv.writer(file, delimiter='\t')
         writer.writerow(header_list)  
-
 
 def write_file(file_path, data_list):
     with open(file_path, 'a', newline='') as file:

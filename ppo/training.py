@@ -1,19 +1,44 @@
 """
 This file contains PPO training algorithm
 """
-
 import time
+import threading #to make update and maintenance run concurrently
+import copy
 import torch
+import torch.nn as nn
 import numpy as np
+from measurement.sensors import OutputManager
+from utilities.utils import write_file
 
-from utils import write_file
-
-
+#construct PPOTraining class
 class PPOTraining:
-    def __init__(self, env, device, actor_model, critic_model, actor_optimizer, 
-                 critic_optimizer, ppo_train_epochs, ppo_steps, 
-                 ppo_update_epochs, gamma, gae_lambda, epsilon_clip, entropy_beta, 
-                 save_interval, chkpnt_dir, fname_batch, fname_update):
+    def __init__(
+        self,
+        env,
+        device,
+        actor_model,
+        critic_model,
+        actor_optimizer,
+        critic_optimizer,
+        ppo_train_epochs,
+        ppo_steps,
+        ppo_update_epochs,
+        reward_alpha,
+        ppo_lower_return_limit,
+        ppo_upper_return_limit,
+        own_returns_flag,
+        gamma,
+        epsilon_clip,
+        entropy_beta,
+        save_interval,
+        enable_maintenance,
+        control_dt,
+        reward_window,
+        chkpnt_dir,
+        fname_batch,
+        fname_update,
+        fname_ppo_epoch,
+    ):
         """
         Initializes PPOTraining object.
         """
@@ -24,395 +49,282 @@ class PPOTraining:
         self.actor_optimizer = actor_optimizer
         self.critic_model = critic_model
         self.critic_optimizer = critic_optimizer
-        
+
         self.ppo_train_epochs = ppo_train_epochs
         self.ppo_steps = ppo_steps
         self.ppo_update_epochs = ppo_update_epochs
-        
-        self.mask = torch.cat((torch.ones((self.ppo_steps - 1, 1), 
-                                          dtype=torch.float32, 
-                                          device=self.device), 
-                               torch.zeros((1, 1), dtype=torch.float32, 
-                                           device=self.device)))
+        self.own_returns_flag=own_returns_flag
+        self.alpha = reward_alpha
+        self.ppo_lower_return_limit = ppo_lower_return_limit
+        self.ppo_upper_return_limit = ppo_upper_return_limit
+        self.reward_window=reward_window
         self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        
+
         self.epsilon_clip = epsilon_clip
         self.entropy_beta = entropy_beta
-        
-        self.chkpnt_dir = chkpnt_dir
         self.save_interval = save_interval
-        
+        self.enable_maintenance = enable_maintenance
+        self.chkpnt_dir = chkpnt_dir
         self.fname_batch = fname_batch
         self.fname_update = fname_update
-        
-    @staticmethod
-    def normalize(x):
-        """
-        Used to normalize the advantage to 0.
-        (Theoretically not necessary but decreases variance of advantages 
-        and makes convergence more stable and faster in practice)
-        """
-        x -= x.mean()
-        x /= (x.std() + 1e-8)
-        return x
+        self.fname_epoch=fname_ppo_epoch
+        self.control_dt = control_dt  # maintenance loop period in seconds
+        self._maintenance_stop_event = None
 
-    def compute_gae_returns(self, next_value, rewards, values):
-        """
-        Calculates GAE returns (return = GAE advantage + old estimated state value)
-        
-        GAE Algorithm
-        
-        1)  mask = 0 if: state = terminal (episode over)
-            mask = 1 else
-        2)  initialize gae = 0 
-            and loop backward from last step in data
-        3)  set delta
-            delta = reward + gamma * next_state_value * mask - state_value
-        4)  update gae
-            gae = delta + gammma * lambda * mask * gae
-        5)  return for state and action
-            return(s,a) = gae + state_value
-        6)  reverse the list to returns back to the correct order
-        """
-        values = values + [next_value]
-        gae = 0
-        returns = []
-        for step in reversed(range(len(rewards))):
-            delta = rewards[step] + self.gamma * values[step + 1] * self.mask[step] - values[step]
-            gae = delta + self.gamma * self.gae_lambda * self.mask[step] * gae
-            # prepend to get correct order back
-            returns.insert(0, gae + values[step])
+    def compute_own_return(self, weighted_rewards):
+        returns=[]
+        assert self.ppo_upper_return_limit >= 1
+        weighted_rewards=torch.cat(weighted_rewards, dim=0)  # [ppo_steps,1]
+        for step in range(self.ppo_steps):
+            end=min(self.ppo_steps, step + self.ppo_upper_return_limit)
+            interval = weighted_rewards[step:end]
+            discounts = (self.gamma ** torch.arange(interval.shape[0], device=weighted_rewards.device)).view(-1, 1)
+            returns.append((interval * discounts).sum(dim=0, keepdim=True))
         return returns
 
+    def compute_weighted_rewards(self, rewards):
+        raw_rewards = torch.cat(rewards, dim=0)  # [ppo_steps,1]
+        weighted_rewards = []
+        for step in range(self.ppo_steps):
+            end = min(self.ppo_steps, step + self.reward_window)
+            avg = raw_rewards[step:end].sum()/(end-step)
+            weighted_rewards.append(self.alpha * raw_rewards[step] + (1 - self.alpha) * avg.view(1, 1))
+        return weighted_rewards
+
     def compute_mc_returns(self, rewards):
-        """
-        Calculates the return of each state using Monte Carlo 
-        (easier to understand but not as good as GAE)
-        -> just used for debugging and written statistics
-        """
+        returns=[]
         discounted_reward = 0
-        returns = []
         for step in reversed(range(len(rewards))):
-            discounted_reward = rewards[step] + self.gamma * discounted_reward
+            discounted_reward = rewards[step]+self.gamma*discounted_reward
             returns.insert(0, discounted_reward)
         return returns
 
-    def compute_own_returns(self, rewards, next_rewards):
-        """
-        Own return calculation. Takes for each step the reward plus the next three rewards as return value.
-        """
-        returns = []
-        next_rewards_tensor_list = [torch.tensor(next_reward).unsqueeze(0) for next_reward in next_rewards]
-        rewards = rewards + next_rewards_tensor_list
+    # Maintenance actuation loop to be run in a separate thread, can be used for inference after training as well
+    def maintenance_actuation_loop(self, deploy_actor_model, stop_event):
+        voltage= self.env.sensors_in.measure_voltage_corrected()
+        s = self.env.get_state(voltage)
+        deploy_actor_model.eval()
+        step_idx = 0  # for debugging purposes does not impede functionality
+        while not stop_event.is_set():
+            start_time = time.perf_counter()
+            with torch.inference_mode():
+                state_tensor = torch.as_tensor(s, dtype=torch.float32, device=self.device)
+                dist = deploy_actor_model(state_tensor)
+                action = dist.sample()  # same principle as in collect_batch
+            next_state, _, _ = self.env.step(bool(action.item()))
+            s = next_state
+            while (time.perf_counter() - start_time) < self.control_dt:
+                pass
+            step_idx += 1
 
-        for step in reversed(range(self.ppo_steps)):
-            return_ = torch.stack(rewards[step+1:step+5]).sum(dim=0)
-            returns.insert(0, return_)
-        return returns
-
-    def ppo_update(self, frame_idx, train_epoch, states, actions, act_log_probs, returns, advantages):
-        """
-        Function to update the policy and value network.
-            1. pass state into networks, obtain predicted actions, values, entropy and new_log_probs
-            2. calculate surrogate policy loss and mean squared error value loss
-            3. backpropagate the losses through networks using Stochastic Gradient Descent (SGD)
-        """
-        
-        epoch_numbers = []
-        epoch_actor_losses = []
-        epoch_critic_losses = []
-        entropy_losses = []
-        epoch_entropies = []
-
-        for update_epoch in range(1, self.ppo_update_epochs + 1):
-            
-            # print(f'\n##### Update Epoch: {update_epoch} #####\n')
-            
-            # model prediction of dist and value for all states in batch
-            dists = self.actor_model(states)
-            values = self.critic_model(states)
-            
-            entropy = dists.entropy().mean()
-            new_log_probs = dists.log_prob(actions)
-            
-            ### Calculate surrogate losses ###
-            ratio = (new_log_probs - act_log_probs).exp()
-            
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - self.epsilon_clip, 1.0 + self.epsilon_clip) * advantages
-
-            ### Calculate actor and critic losses ###
-            actor_loss  = - torch.min(surr1, surr2).mean()
-            critic_loss = (returns - values).pow(2).mean()
-            entropy_loss = - self.entropy_beta * entropy
-            
-            ### Backpropagation ### (old time for one NN ~0.004)
-            self.actor_optimizer.zero_grad()
-            (actor_loss + entropy_loss).backward()
-            self.actor_optimizer.step()
-            
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
-
-            ### Store Data ###
-            epoch_numbers.append(update_epoch)
-            epoch_actor_losses.append(actor_loss.item())
-            epoch_critic_losses.append(critic_loss.item())
-            entropy_losses.append(entropy_loss.item())
-            epoch_entropies.append(entropy.item())
-
-        return epoch_numbers, epoch_actor_losses, epoch_critic_losses, entropy_losses, epoch_entropies
 
     def collect_batch(self):
-        """
-        Collects a batch of PPO_STEPS by acting in the environment with current policy
-        """
-        ### Reset the environment ###
-        # state = self.env.reset()
-        state, vol_flow, tau = self.env.reset()
-        
-        ### Batch data ###
-        act_log_probs = []
-        values    = []
-        states    = []
-        actions   = []
-        rewards   = []
-        dist_probs = []
-        vol_flows = []
-        taus = []
-
+        act_log_probs, values, states, actions, rewards, dist_probs, voltages, next_states = [], [], [], [], [], [], [], []
+        state,voltage = self.env.reset()
         for step in range(self.ppo_steps):
-
-            step_start_time = time.perf_counter()  # for fixed time for step
-
-            ### Get action and value prediction ### ~ ??? s (virtual env.)
-            state = torch.FloatTensor(state).to(self.device)
-            dist = self.actor_model(state)
-            value = self.critic_model(state)
-            action = dist.sample()
-    
-            ### Pass action to environment and obtain reward and next state ### ~ 0.0002 s (virtual env.)
-            next_state, reward, _, next_vol_flow, next_tau = self.env.step(bool(action.item()))
-
-            ### Get action-log-distribution ### ~ 0.0004 s (virtual env.)
-            act_log_prob = dist.log_prob(action)
-            
-            ### Store data ### ~ 0.0001 s (virtual env.)
-            act_log_probs.append(act_log_prob)
-            values.append(value)
-            rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(self.device))
-            states.append(state)
-            actions.append(action)
-            dist_probs.append(dist.probs)  # (for stats)
-            vol_flows.append(vol_flow)
-            taus.append(tau)
-
-            vol_flow = next_vol_flow
-            tau = next_tau
-
-            state = next_state
-
-            ### Ensure step takes at least 0.005 s ###
-            while(time.perf_counter() - step_start_time) < 0.005:
-                pass
-
-        ### get three additional rewards for own returns
-        next_rewards = []
-
-        for _ in range(5):
-            step_start_time = time.perf_counter()  # for fixed time for step
-
-            ### Get action and value prediction ### ~ ??? s (virtual env.)
-            state = torch.FloatTensor(state).to(self.device)
-            dist = self.actor_model(state)
+            step_start_time = time.perf_counter() #read start time for pacing
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            dist = self.actor_model(state_tensor)  # get distribution variable p from actor model
+            value = self.critic_model(state_tensor).to(self.device)  # get predicted value from critic. value needs to be a tensor for the reward calculation
             action = dist.sample()
 
-            ### Pass action to environment and obtain reward and next state ### ~ 0.0002 s (virtual env.)
-            next_state, reward, _, _, _ = self.env.step(bool(action.item()))
-
-            next_rewards.append(reward)
+            next_state, reward, next_voltage_corrected = self.env.step(bool(action.item()))
+            act_log_prob=dist.log_prob(action)
+            act_log_probs.append(act_log_prob.unsqueeze(0))
+            values.append(value.unsqueeze(0))
+            if isinstance(reward, torch.Tensor):
+                reward_tensor = reward.flatten().float().to(self.device)
+            else:
+                reward_tensor = torch.tensor(reward, dtype=torch.float32, device=self.device)
+            rewards.append(reward_tensor.unsqueeze(0))  # shape [1, 1]
+            states.append(state_tensor.unsqueeze(0))
+            actions.append(action.unsqueeze(0))
+            dist_probs.append(dist.probs.unsqueeze(0))
+            next_states.append(torch.FloatTensor(next_state).to(self.device).unsqueeze(0))# (for stats)
+            voltages.append(np.array(voltage))
+            voltage = next_voltage_corrected
             state = next_state
-
-            ### Ensure step takes at least 0.005 s ###
-            while (time.perf_counter() - step_start_time) < 0.005:
+            while (time.perf_counter() - step_start_time) < self.control_dt:
                 pass
+        return actions, states, next_states, rewards, values, dist_probs, act_log_probs, voltages
+    @staticmethod
+    def compute_selected_gamma(states):
+        s = torch.cat(states, dim=0).reshape(-1)  # flatten tensor to treat it as list of states
+        return float((s > 0).float().mean().item())
 
-        # open valves after batch collection (for training with constant volume flow)
-        self.env.sensors.open_valve()
-        # self.env.sensors.close_valve()
+    #output of collect_batch in correct order: actions, states, next_states, rewards, values, dist_probs, act_log_probs, voltages
+    def ppo_update(self, train_epoch, actions, states, act_log_probs, returns, advantages):
+            """
+            Function to update the policy and value network.
+                1. pass state into networks, obtain predicted actions, values and new_log_probs
+                2. calculate surrogate policy loss and mean squared error value loss
+                3. backpropagate the losses through networks using Stochastic Gradient Descent (SGD)
+            """
+            epoch_numbers = []
+            epoch_actor_losses = []
+            epoch_critic_losses = []
+            entropy_losses = []
+            epoch_entropies = []
+            clamped_fractions = []
 
-        return act_log_probs, values, states, actions, rewards, dist_probs, next_state, next_rewards, vol_flows, taus
+            for update_epoch in range(1, self.ppo_update_epochs + 1):
 
-    def calc_batch_gamma(self, taus):
-        """
-        Calculates the forward flow fraction of a batch for each sensor
-        -> used for written statistics
-        """
-        num_sensors = len(taus[0])
-        gamma = []  # list with gamma of each sensor
-        for idx in range(num_sensors):
-            sensor_values = [sublist[idx] for sublist in taus]
-            pos_count = sum(1 for value in sensor_values if value > 0)
-            sensor_gamma = pos_count/self.ppo_steps
-            gamma.append(sensor_gamma)
-            
-        return gamma
+                values = self.critic_model(states)
 
-    def test_env(self):
-        # not tested jet
-        """
-        Test the total reward of a trained model
-        for PPO_STEPS steps in the environment
-        """
-        ### Test data ###
-        states    = []
-        actions   = []
-        rewards   = []
-        dist_probs = []
-        vol_flows = []
-        taus = []
+                dists = self.actor_model(states)
 
-        state, vol_flow, tau = self.env.reset()
-        total_reward = 0
+                entropy = dists.entropy().mean()
+                new_log_probs = dists.log_prob(actions)
 
-        for _ in range(self.ppo_steps):
+                ratio = (new_log_probs - act_log_probs).exp()
 
-            step_start_time = time.perf_counter()  # for fixed time for step
+                surr1 = ratio * advantages
+                surr2 = (torch.clamp(ratio, 1.0 - self.epsilon_clip, 1.0 + self.epsilon_clip) * advantages)
 
-            state = torch.FloatTensor(state).to(self.device)
-            dist = self.actor_model(state)
-            # value = self.critic_model(state)
-            # action = dist.sample()
-            dist_prob = dist.probs.item()
-            action = round(dist_prob)
-            next_state, reward, _, next_vol_flow, next_tau = self.env.step(bool(action))
-            # reward = reward.item()
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss=nn.MSELoss(reduction="mean")(values,returns)
 
-            ### Store data ###
-            rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(self.device))
-            states.append(state)
-            actions.append(action)
-            dist_probs.append(dist_prob)
-            vol_flows.append(vol_flow)
-            taus.append(tau)
+                entropy_loss = - self.entropy_beta * entropy
 
-            vol_flow = next_vol_flow
-            tau = next_tau
-            state = next_state
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic_optimizer.step()
+                if train_epoch > 0:
+                    self.actor_optimizer.zero_grad()
+                    (actor_loss + entropy_loss).backward()
+                    self.actor_optimizer.step()
 
-            total_reward += reward
+                epoch_numbers.append(update_epoch)
+                epoch_actor_losses.append(actor_loss.item())
+                epoch_critic_losses.append(critic_loss.item())
+                entropy_losses.append(entropy_loss.item())
+                epoch_entropies.append(entropy.item())
 
-            ### Ensure step takes at least 0.005 s ###
-            while(time.perf_counter() - step_start_time) < 0.005:
-                pass
+                clamped = (ratio < (1.0 - self.epsilon_clip)) | (ratio > (1.0 + self.epsilon_clip))
+                clamped_fraction = clamped.float().mean().item()
+                clamped_fractions.append(clamped_fraction)
 
-        sensor_gamma = self.calc_batch_gamma(taus)
-        epoch_mean_gamma = np.mean(sensor_gamma)
-
-        return states, actions, rewards, dist_probs, vol_flows, taus, total_reward, epoch_mean_gamma, sensor_gamma
+            return (epoch_numbers,
+                epoch_actor_losses,
+                epoch_critic_losses,
+                entropy_losses,
+                epoch_entropies,
+                clamped_fractions)
 
     def train(self):
-        """
-        Main PPO training loop 
-        with batch colletion and network update for PPO_TRAIN_EPOCHS epochs
-        """
-        frame_idx = 0
+        frame_idx=0
+        update_frame=0
+        for train_epoch in range (1, self.ppo_train_epochs + 1):
+            print(f"\n##### Training Epoch: {train_epoch} #####\n")
+            (actions, states, next_states, rewards, values, dist_probs, act_log_probs, voltages)=self.collect_batch()
+            maintenance_thread = None
+            maintenance_stop_event = None
+            try:
+                if self.enable_maintenance:
+                    deploy_actor_model = copy.deepcopy(self.actor_model)
+                    maintenance_stop_event = threading.Event()
+                    self._maintenance_stop_event = maintenance_stop_event
 
-        ### Training ###
+                    maintenance_thread = threading.Thread(
+                        target=self.maintenance_actuation_loop,
+                        args=(deploy_actor_model, maintenance_stop_event),
+                        daemon=True,
+                    )
+                    maintenance_thread.start()
+                else:
+                    om: OutputManager = self.env.sensors_out
+                    om.open_valve()
 
-        for train_epoch in range(1, self.ppo_train_epochs + 1):
+                weighted_rewards = self.compute_weighted_rewards(rewards)
+                batch_gamma = self.compute_selected_gamma(states)
 
-            print(f'\n##### Training Epoch: {train_epoch} #####\n')
+                if self.own_returns_flag: returns = torch.cat(self.compute_own_return(weighted_rewards)).detach()
+                else: returns=torch.cat(self.compute_mc_returns(weighted_rewards)).detach()
 
-            ### Collect new batch ###
-            act_log_probs, values, states, actions, rewards, dist_probs, next_state, next_rewards, vol_flows, taus = self.collect_batch()
+                act_log_probs = torch.cat(act_log_probs).detach()
+                values = torch.cat(values).detach()
+                states = torch.cat(states)
+                next_states = torch.cat(next_states)
+                actions = torch.cat(actions)
+                dist_probs = torch.cat(dist_probs).detach()
+                rewards = torch.cat(rewards).detach()
+                weighted_rewards = torch.cat(weighted_rewards).detach()
 
-            # time duration of update and write time
-            update_and_write_start_time = time.perf_counter()
+                advantages = (returns - values).detach()
+                epoch_total_reward = rewards.sum().item()
 
-            ### Calculate returns for the batch using GAE ###
-            next_state = torch.FloatTensor(next_state).to(self.device) # convert state to torch tensor
-            next_value = self.critic_model(next_state)  # get model value prediction
+                count_valve_open = actions.sum().item()
 
-            gae_returns = self.compute_gae_returns(next_value, rewards, values)
-            mc_returns = self.compute_mc_returns(rewards)  # monte carlo returns (just for stats)
-            own_returns = self.compute_own_returns(rewards, next_rewards)
+                for step in range(self.ppo_steps):
+                    frame_idx += 1
+                    ppo_batch_data = (
+                        [
+                            frame_idx,
+                            train_epoch,
+                            step+1,
+                            actions[step, 0].item(),
+                            states[step, 0].item(),
+                            rewards[step, 0].item(),
+                            weighted_rewards[step, 0].item(),
+                            next_states[step, 0].item(),
+                            returns[step, 0].item(),
+                            values[step, 0].item(),
+                            advantages[step, 0].item(),
+                            dist_probs[step, 0].item(),
+                            act_log_probs[step, 0].item(),
+                        ]
+                        + voltages[step].tolist()
+                    )
+                    write_file(self.fname_batch, ppo_batch_data)
+                (update_epoch,epoch_actor_losses,epoch_critic_losses,entropy_losses,epoch_entropies,clamped_fractions)= self.ppo_update(train_epoch,actions,states,act_log_probs,returns,advantages)
 
-            ### Detach and concatenat tensor lists ###
-            rewards = torch.cat(rewards).detach()
-            act_log_probs = torch.cat(act_log_probs).detach()
-            values = torch.cat(values).detach()
-            states = torch.cat(states)
-            actions = torch.cat(actions)
-            gae_returns = torch.cat(gae_returns).detach()
-            mc_returns = torch.cat(mc_returns).detach()
-            own_returns = torch.cat(own_returns).detach()
-            dist_probs = torch.cat(dist_probs).detach()
+                for update in range(self.ppo_update_epochs):
+                    update_frame+=1
+                    ppo_update_data = [
+                        update_frame,
+                        update+1,
+                        epoch_actor_losses[update],
+                        epoch_critic_losses[update],
+                        entropy_losses[update],
+                        epoch_entropies[update],
+                        clamped_fractions[update]
+                    ]
+                    write_file(self.fname_update, ppo_update_data)
 
-            ### Calculate advantage for the batch ###
-            gae_advantages = gae_returns - values
-            gae_advantages = self.normalize(gae_advantages)
-            
-            mc_advantages = mc_returns - values  # monte carlo advantage (just for stats)
-            mc_advantages = self.normalize(mc_advantages)
+                mean_state_ref = float(states.mean().item())
+                mean_duty_cycle = float(actions.float().mean().item())
+                gamma_all_steps = [float((vs > 0.0).sum()) / 6.0 for vs in voltages]
+                mean_gamma_all_channels = float(np.mean(gamma_all_steps))
+                ppo_epoch_data = [
+                    int(train_epoch),
+                    float(epoch_total_reward),
+                    float(epoch_total_reward / self.ppo_steps),
+                    float(np.mean(epoch_actor_losses)),
+                    float(np.mean(epoch_critic_losses)),
+                    float(np.mean(entropy_losses)),
+                    mean_state_ref,
+                    float(batch_gamma),
+                    mean_gamma_all_channels,
+                    mean_duty_cycle,
+                ]
+                write_file(self.fname_epoch, ppo_epoch_data)
 
-            own_advantages = own_returns - values
-            own_advantages = self.normalize(own_advantages)
+                if train_epoch % self.save_interval == 0:
+                    torch.save(
+                        self.actor_model.state_dict(),
+                        f"{self.chkpnt_dir}/epoch_{train_epoch}_torch_actor_model",
+                    )
+                    torch.save(
+                        self.critic_model.state_dict(),
+                        f"{self.chkpnt_dir}/epoch_{train_epoch}_torch_critic_model",
+                    )
+                    print("\n##### Models saved #####\n")
+                print(
+                    f"\nTraining Epoch: {train_epoch} \nTotal local Rewards of current Batch: {rewards.sum().item()} \nTotal weighted Rewards of current Batch: {weighted_rewards.sum().item()} \nMean Reward per step of current Batch: {rewards.sum().item() / self.ppo_steps}\nMean Weighted Reward per step of current Batch: {weighted_rewards.sum().item() / self.ppo_steps}\nMean Return of current Batch: {returns.sum().item() / self.ppo_steps} \nBatchsize: {self.ppo_steps}\nEpoch mean actor losses: {np.mean(epoch_actor_losses)}\nEpoch mean critic losses: {np.mean(epoch_critic_losses)}\nForward Flow Fraction at reference sensor (over batch): {batch_gamma}\nCount valve open: {count_valve_open}\nEntropy Losses: {np.mean(entropy_losses)}\nEntropy: {np.mean(epoch_entropies)}\n"
+                )
 
-            # print(f'actions: {actions}')
-            
-            ### Calculate total reward of current batch ### (for stats)
-            epoch_total_reward = sum(rewards).item()
-            
-            ### Calculate gamma ### (for stats)
-            sensor_gamma = self.calc_batch_gamma(taus)
-            epoch_mean_gamma = np.mean(sensor_gamma)
-
-            ### Calculate number of states where valve was opened ###
-            count_valve_open = sum(actions).item()
-            
-            ### Write PPO Batch data to file ### ~ 0.005 s
-            for step in range(self.ppo_steps):
-
-                frame_idx += 1
-                state_elements = [s.item() for s in states[step]]
-                action_elements = [a.item() for a in actions[step]]
-
-                ppo_batch_data = [frame_idx, train_epoch, step + 1, 
-                                  epoch_total_reward,
-                                  gae_returns[step].item(),
-                                  mc_returns[step].item(),
-                                  own_returns[step].item(),
-                                  values[step].item(),
-                                  rewards[step].item(), 
-                                  gae_advantages[step].item(), 
-                                  mc_advantages[step].item(),
-                                  own_advantages[step].item(),
-                                  act_log_probs[step].item(), 
-                                  dist_probs[step].item()] + action_elements + [count_valve_open] + state_elements + \
-                                 [vol_flows[step]] + taus[step] + [epoch_mean_gamma] + sensor_gamma
-
-                write_file(self.fname_batch, ppo_batch_data)
-
-            ### Optimizing the policy and value network ###
-            update_numbers, update_actor_losses, update_critic_losses, update_entropy_losses, update_entropies = self.ppo_update(frame_idx, train_epoch, states,
-                                              actions, act_log_probs, 
-                                              own_returns, own_advantages)
-            
-            ### Write PPO Update data to file ###
-            for epoch in range(len(update_numbers)):
-                ppo_update_data = [frame_idx, train_epoch, update_numbers[epoch], update_actor_losses[epoch], update_critic_losses[epoch], update_entropy_losses[epoch], update_entropies[epoch]]
-                write_file(self.fname_update, ppo_update_data)
-            
-            ### Save models ###
-            if train_epoch % self.save_interval == 0:
-                torch.save(self.actor_model.state_dict(), f'{self.chkpnt_dir}/epoch_{train_epoch}_torch_actor_model')
-                torch.save(self.critic_model.state_dict(), f'{self.chkpnt_dir}/epoch_{train_epoch}_torch_critic_model')
-                print("\n##### Models saved #####\n")
-            
-            print(f'\nTraining Epoch: {train_epoch} \nTotal Reward of current Batch: {sum(rewards).item()} \nBatchsize: {self.ppo_steps}\nEpoch mean actor losses: {np.mean(update_actor_losses)}\nEpoch mean critic losses: {np.mean(update_critic_losses)}\nEpoch mean entropy: {np.mean(update_entropies)}\nMean Forward Flow Fraction: {epoch_mean_gamma}\nCount valve open: {count_valve_open}\n')
-
-            # time duration of update and write time
-            # print(f'update_and_write_start_time: {time.perf_counter() - update_and_write_start_time}')
+            finally:
+                if maintenance_stop_event is not None:
+                    maintenance_stop_event.set()
+                if maintenance_thread is not None:
+                    maintenance_thread.join(timeout=2.0)

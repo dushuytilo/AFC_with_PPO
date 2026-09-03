@@ -1,5 +1,5 @@
 """
-This file contains the Channels used by the InputOutputManager.
+This file contains the Channels used by the Input-/OutputManager.
 """
 
 import nidaqmx
@@ -11,8 +11,16 @@ class ChannelVoltageIn:
     """
     Class for a Single or Multiple Channel Object with an input task to measure voltage.
     """
-    def __init__(self, channel: str, sampling_rate: int = None, num_samples: int = None, min_val: float = None, max_val: float = None,
-                 terminal_config=nidaqmx.constants.TerminalConfiguration.DEFAULT):
+
+    def __init__(
+        self,
+        channel: str,
+        sampling_rate: int = None,
+        num_samples: int = None,
+        min_val: float = None,
+        max_val: float = None,
+        terminal_config=nidaqmx.constants.TerminalConfiguration.DEFAULT,
+    ):
         """
         Initializes ChannelVoltageIn.
 
@@ -42,7 +50,12 @@ class ChannelVoltageIn:
         self.task = nidaqmx.Task()
 
         # Add an analog input channel
-        self.task.ai_channels.add_ai_voltage_chan(self.channel, min_val=min_val, max_val=max_val, terminal_config=terminal_config)
+        self.task.ai_channels.add_ai_voltage_chan(
+            self.channel,
+            min_val=min_val,
+            max_val=max_val,
+            terminal_config=terminal_config,
+        )
 
         # Start task
         self.task.start()
@@ -70,35 +83,46 @@ class ChannelVoltageOut:
     """
     Class for a Single of Multi Channel Object with an output task to generate voltage.
     """
+
     def __init__(self, channel: str, sampling_rate: int, num_of_channels: int):
         """
         Initializes ChannelVoltageOut.
 
         Parameters
         ----------
-        channel: str
-            Name of the channel e.g. "Dev1/ao0".
+        channel: str, e.g., "Dev1/ao0" or ["Dev1/ao0", "Dev1/ao1"]
+            Name of the channel (e.g. "Dev1/ao0") or list of channel names.
         sampling_rate: int
             Specifies the sampling rate in samples per channel per second.
         num_of_channels: int
             Specifies the number of channels of the output task.
+            If 'channel' is a list, this should match len(channel).
         """
 
         # Assign variables
         self.channel = channel
         self.sampling_rate = sampling_rate
         self.num_of_channels = num_of_channels
-
         # Set up task
         self.task = nidaqmx.Task()
 
-        # Add an analog output channel
-        self.task.ao_channels.add_ao_voltage_chan(self.channel)
+        # Add an analog output channel(s)
+        if isinstance(self.channel, str):
+            # If channel is a single string, add it directly
+            self.task.ao_channels.add_ao_voltage_chan(self.channel)
+        elif isinstance(self.channel, list):
+            # If channel is a list of strings, iterate and add each one
+            for individual_channel_name in self.channel:
+                self.task.ao_channels.add_ao_voltage_chan(individual_channel_name)
+        else:
+            # Handle cases where channel is neither a string nor a list
+            raise TypeError(
+                f"Channel parameter must be a string or a list of strings, but got {type(self.channel)}"
+            )
 
         # Configure regeneration mode
         # after buffer is written same data is written again in a loop until there is new data
         self.task.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
-
         # Start task
         self.task.start()
 
